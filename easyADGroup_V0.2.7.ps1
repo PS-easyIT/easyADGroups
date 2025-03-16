@@ -325,13 +325,21 @@ function Get-ADData {
         # [GERMAN - Ruft alle Organisationseinheiten aus AD ab]
         Write-DebugMessage "Rufe alle OUs aus AD ab..."
         $script:allOUs = Get-ADOrganizationalUnit -Filter * -Properties Name, DistinguishedName |
+            # Filtere Standard-OUs heraus (basierend auf deren Standardnamen oder Strukturen)
+            Where-Object {
+                # Filtere Standard-OUs wie "Domain Controllers", "Users", "Computers" heraus
+                $excludedOUs = @('Domain Controllers', 'Users', 'Computers', 'Builtin')
+                $_.Name -notin $excludedOUs -and
+                # Filtere auch Container-Objekte heraus (beginnen mit CN= statt OU=)
+                $_.DistinguishedName -notlike "CN=*"
+            } |
             ForEach-Object {
                 [PSCustomObject]@{
                     Name = $_.Name
                     DN   = $_.DistinguishedName
                 }
             } | Sort-Object Name
-        Write-DebugMessage "Anzahl gefundener OUs: $($script:allOUs.Count)"
+        Write-DebugMessage "Anzahl gefundener OUs nach Filterung: $($script:allOUs.Count)"
         
         # [7.1.2 | USER RETRIEVAL]
         # [ENGLISH - Retrieve users from AD (limited to 200)]
@@ -474,6 +482,48 @@ function Test-Input {
     }
     elseif ($textBoxPrefix.Text -match '[\\/:*?"<>|]') {
         $errors += 'Gruppenname enthält ungültige Zeichen: \ / : * ? ` " < > |'
+    }
+    
+    # [NEUE FUNKTION] - Validierung der Gruppennamen auf ungültige AD-Zeichen
+    $groupsToValidate = @()
+    
+    if ($chkSpecial.Checked) {
+        $suffixes = $adgroupsConfig.AdditionalSuffixes.Split(",")
+        foreach ($suffix in $suffixes) {
+            $groupsToValidate += "$($textBoxPrefix.Text.Trim())$($textBoxSeparator.Text.Trim())$suffix"
+        }
+    }
+    elseif (($textBoxStart.Text.Trim() -eq "") -and ($textBoxEnd.Text.Trim() -eq "")) {
+        $groupsToValidate += "$($textBoxPrefix.Text.Trim())"
+    }
+    else {
+        if ($errors.Count -eq 0) { # Nur ausführen, wenn keine Fehler bei Start/End
+            $start = [int]$textBoxStart.Text.Trim()
+            $end = [int]$textBoxEnd.Text.Trim()
+            for ($i = $start; $i -le $end; $i++) {
+                $groupsToValidate += "$($textBoxPrefix.Text.Trim())$($textBoxSeparator.Text.Trim())$i"
+            }
+        }
+    }
+    
+    # Validiere alle Gruppennamen
+    foreach ($groupName in $groupsToValidate) {
+        # Prüfe auf ungültige AD-Zeichen (ergänzt zu den bereits geprüften Zeichen)
+        if ($groupName -match '[,;@\[\]{}+=&~!#%^()''`]') {
+            $errors += "Gruppenname '$groupName' enthält ungültige Zeichen für Active Directory."
+            break # Stoppe nach dem ersten fehlerhaften Namen
+        }
+        
+        # Prüfe auf Längenbeschränkungen
+        if ($groupName.Length > 256) {
+            $errors += "Gruppenname '$groupName' ist zu lang (max. 256 Zeichen)."
+            break
+        }
+        
+        # Prüfe SAMAccountName-Länge
+        if ($groupName.Length > 20) {
+            Write-DebugMessage "SAMAccountName für '$groupName' wird auf 20 Zeichen gekürzt"
+        }
     }
     
     # [8.1.4 | VALIDATION RESULT]
@@ -883,6 +933,7 @@ $buttonCreate.Add_Click({
         Size = New-Object System.Drawing.Size(300, 100)
         StartPosition = "CenterScreen"
         FormBorderStyle = "FixedDialog"
+        TopMost = $true
     }
     $progressBar = New-Object System.Windows.Forms.ProgressBar -Property @{
         Location = New-Object System.Drawing.Point(10, 10)
@@ -896,12 +947,31 @@ $buttonCreate.Add_Click({
     $progressForm.Show()
     $progressForm.Refresh()
     
-    # Speichere ausgewählte Benutzer vorher, da ein UI-Thread-Problem auftreten könnte
+    # FIXIERT: Verbesserte Benutzerauswahl-Extraktion
     $script:selectedUsers = @()
-    foreach ($item in $listBoxUsers.SelectedItems) {
-        if ($item -is [System.Data.DataRow]) {
-            $script:selectedUsers += $item["SamAccountName"]
+    if ($listBoxUsers.SelectedItems.Count -gt 0) {
+        Write-DebugMessage "Ausgewählte Benutzer werden extrahiert... ($($listBoxUsers.SelectedItems.Count) Elemente)"
+        
+        foreach ($selectedItem in $listBoxUsers.SelectedItems) {
+            try {
+                # Korrekter Zugriff auf die SamAccountName-Eigenschaft
+                $samAccountName = $selectedItem.Item("SamAccountName")
+                if (-not [string]::IsNullOrWhiteSpace($samAccountName)) {
+                    $script:selectedUsers += $samAccountName
+                    Write-DebugMessage "Benutzer ausgewählt: $samAccountName"
+                }
+            }
+            catch {
+                Write-LogMessage "Fehler beim Extrahieren des SamAccountName: $($_.Exception.Message)" -logLevel "WARNING"
+                Write-DebugMessage "Ausgewähltes Item-Typ: $($selectedItem.GetType().FullName)"
+                Write-DebugMessage "Properties: $($selectedItem | Format-List | Out-String)"
+            }
         }
+        
+        Write-LogMessage "Es wurden $($script:selectedUsers.Count) Benutzer für die Gruppenmitgliedschaft ausgewählt" -logLevel "INFO"
+        Write-DebugMessage "Ausgewählte Benutzer: $($script:selectedUsers -join ', ')"
+    } else {
+        Write-LogMessage "Keine Benutzer für Gruppenmitgliedschaft ausgewählt" -logLevel "INFO"
     }
     
     try {
@@ -930,73 +1000,132 @@ $buttonCreate.Add_Click({
         $count = 0
         
         foreach ($groupName in $groupsToCreate) {
-            $params = @{
-                Name        = $groupName
-                Path        = $comboBoxOU.SelectedValue
-                GroupScope  = if ($radioGlobal.Checked) { "Global" } elseif ($radioUniversal.Checked) { "Universal" } else { "DomainLocal" }
-                Description = if ($textBoxDescription.Text) { $textBoxDescription.Text } else { $adgroupsConfig.GroupDescription }
+            # SAMAccountName-Überprüfung (max. 256 Zeichen für Namen, 20 für SAM)
+            $samAccountName = $groupName
+            if ($samAccountName.Length > 20) {
+                $samAccountName = $samAccountName.Substring(0, 20)
+                Write-LogMessage "SAMAccountName für $groupName wurde auf $samAccountName gekürzt (max. 20 Zeichen)" -logLevel "WARNING"
             }
-            if ($radioSecurity.Checked) { $params["GroupCategory"] = "Security" }
-            else { $params["GroupCategory"] = "Distribution" }
-            if ($os.ProductType -eq 1) { $params["Server"] = $adConfig.ADServer }
+            
+            if ($groupName.Length > 256) {
+                $groupName = $groupName.Substring(0, 256)
+                Write-LogMessage "Gruppenname wurde auf $groupName gekürzt (max. 256 Zeichen)" -logLevel "WARNING"
+            }
+            
+            # Prüfe auf problematische Zeichen, die nicht bereits durch die Validierung abgefangen wurden
+            if ($groupName -match '[,;@\[\]{}+=&~!#%^()''`]' -or $groupName -match '[\\/:*?"<>|]') {
+                Write-LogMessage "Gruppenname $groupName enthält ungültige Zeichen - wird übersprungen" -logLevel "ERROR"
+                continue
+            }
+            
+            $params = @{
+                Name          = $groupName
+                SamAccountName = $samAccountName
+                Path          = if ($comboBoxOU.SelectedValue -is [string]) { $comboBoxOU.SelectedValue } else { $comboBoxOU.SelectedValue.DN }
+                GroupScope    = if ($radioGlobal.Checked) { "Global" } elseif ($radioUniversal.Checked) { "Universal" } else { "DomainLocal" }
+                Description   = if ($textBoxDescription.Text) { $textBoxDescription.Text } else { $adgroupsConfig.GroupDescription }
+                DisplayName   = $groupName
+            }
+            
+            # Debug-Ausgabe erweitern zur besseren Fehlerdiagnose
+            Write-DebugMessage "Erstelle Gruppe: $groupName mit Pfad: $($params.Path) (Typ: $($params.Path.GetType().FullName))"
+            
+            # Server-Parameter nur hinzufügen, wenn ADServer definiert ist
+            if ($os.ProductType -eq 1 -and $adConfig.ADServer) { 
+                $params["Server"] = $adConfig.ADServer 
+            }
             
             Write-DebugMessage "Erstelle Gruppe: $($params | ConvertTo-Json -Compress)"
             try {
-                # Prüfe, ob die Gruppe bereits existiert
+                # Verbesserte Prüfung, ob die Gruppe bereits existiert (nach SAMAccountName)
                 $existingGroup = $null
                 try {
-                    $existingGroup = Get-ADGroup -Identity $groupName -ErrorAction Stop
-                } catch {
+                    $existingGroup = Get-ADGroup -Identity $samAccountName -Properties * -ErrorAction SilentlyContinue
+                }
+                catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                     # Gruppe existiert nicht - das ist gut
+                    Write-DebugMessage "Gruppe ${samAccountName} existiert nicht - kann erstellt werden"
+                }
+                catch {
+                    Write-LogMessage "Fehler bei Prüfung auf existierende Gruppe ${samAccountName}: $($_.Exception.Message)" -logLevel "WARNING"
                 }
                 
                 if ($existingGroup) {
-                    Write-LogMessage "Gruppe $groupName existiert bereits - wird übersprungen" -logLevel "WARNING"
+                    Write-LogMessage "Gruppe mit SAMAccountName $samAccountName existiert bereits - wird übersprungen" -logLevel "WARNING"
                     continue
                 }
                 
                 Write-LogMessage "Erstelle Gruppe: $($params.Name) in OU: $($params.Path) mit Scope: $($params.GroupScope) und Category: $($params.GroupCategory)" -logLevel "INFO"
-                $group = New-ADGroup @params -PassThru -ErrorAction Stop
                 
-                [void]$script:createdGroups.Add($group.Name)
-                Write-DebugMessage "Gruppe $groupName erfolgreich erstellt"
-                
-                # Verbesserte Benutzerverarbeitung mit vorspeicherten ausgewählten Benutzern
-                if ($script:selectedUsers.Count -gt 0) { 
-                    Write-DebugMessage "Füge $($script:selectedUsers.Count) ausgewählte Mitglieder hinzu: $($script:selectedUsers -join ', ')"
-                    try {
-                        Add-ADGroupMember -Identity $group -Members $script:selectedUsers -ErrorAction Stop
-                        Write-LogMessage "Mitglieder zu $groupName hinzugefügt: $($script:selectedUsers -join ', ')" -logLevel "INFO"
-                    } catch {
-                        Write-LogMessage "Fehler beim Hinzufügen von Mitgliedern zu ${groupName}: $($_.Exception.Message)" -logLevel "ERROR"
-                    }
-                }
-                
-                if ($adgroupsConfig.GroupMembersAddActive -eq "1") {
-                    $fixedMembers = $adgroupsConfig.GroupMembersAdd.Split(",")
-                    if ($fixedMembers) { 
-                        Write-DebugMessage "Füge feste Mitglieder aus INI hinzu: $($fixedMembers -join ', ')"
+                # Verbessertes Error-Handling beim Erstellen der Gruppe
+                try {
+                    $group = New-ADGroup @params -PassThru -ErrorAction Stop
+                    
+                    # Kleine Verzögerung für AD-Replikation
+                    Start-Sleep -Milliseconds 500
+                    
+                    [void]$script:createdGroups.Add($group.Name)
+                    Write-DebugMessage "Gruppe $groupName erfolgreich erstellt"
+                    
+                    # FIXIERT: Verbesserte Benutzerverarbeitung
+                    if ($script:selectedUsers.Count -gt 0) { 
+                        Write-DebugMessage "Füge $($script:selectedUsers.Count) ausgewählte Mitglieder hinzu: $($script:selectedUsers -join ', ')"
                         try {
-                            Add-ADGroupMember -Identity $group -Members $fixedMembers -ErrorAction Stop
-                            Write-LogMessage "Feste Mitglieder zu $groupName hinzugefügt: $($fixedMembers -join ', ')" -logLevel "INFO"
+                            # Verzögerung vor dem Hinzufügen von Mitgliedern
+                            Start-Sleep -Milliseconds 1000
+                            
+                            # Hinzufügen von ausgewählten Benutzern sicherstellen
+                            Add-ADGroupMember -Identity $samAccountName -Members $script:selectedUsers -ErrorAction Stop
+                            Write-LogMessage "Mitglieder zu $groupName hinzugefügt: $($script:selectedUsers -join ', ')" -logLevel "INFO"
                         } catch {
-                            Write-LogMessage "Fehler beim Hinzufügen fester Mitglieder zu ${groupName}: $($_.Exception.Message)" -logLevel "WARNING"
+                            Write-LogMessage "Fehler beim Hinzufügen von Mitgliedern zu ${groupName}: $($_.Exception.Message)" -logLevel "ERROR"
+                            Write-DebugMessage "Vollständige Fehlerdetails: $($_ | Format-List -Force | Out-String)"
+                            
+                            # Fallback: Versuche es erneut mit dem DN der Gruppe
+                            try {
+                                Add-ADGroupMember -Identity $group.DistinguishedName -Members $script:selectedUsers -ErrorAction Stop
+                                Write-LogMessage "Mitglieder zu $groupName hinzugefügt (2. Versuch mit DN)" -logLevel "INFO"
+                            } catch {
+                                Write-LogMessage "Auch 2. Versuch zum Hinzufügen der Mitglieder fehlgeschlagen" -logLevel "ERROR"
+                            }
+                        }
+                    } else {
+                        Write-DebugMessage "Keine Benutzer aus GUI zur Gruppe hinzuzufügen"
+                    }
+                    
+                    # INI-basierte Benutzer
+                    if ($adgroupsConfig.GroupMembersAddActive -eq "1") {
+                        $fixedMembers = $adgroupsConfig.GroupMembersAdd.Split(",")
+                        if ($fixedMembers) { 
+                            Write-DebugMessage "Füge feste Mitglieder aus INI hinzu: $($fixedMembers -join ', ')"
+                            try {
+                                Add-ADGroupMember -Identity $group -Members $fixedMembers -ErrorAction Stop
+                                Write-LogMessage "Feste Mitglieder zu $groupName hinzugefügt: $($fixedMembers -join ', ')" -logLevel "INFO"
+                            } catch {
+                                Write-LogMessage "Fehler beim Hinzufügen fester Mitglieder zu ${groupName}: $($_.Exception.Message)" -logLevel "WARNING"
+                            }
                         }
                     }
+                    
+                    Write-LogMessage "Gruppe $groupName erfolgreich erstellt" -logLevel "INFO"
+                } 
+                catch {
+                    Write-LogMessage "Fehler beim Erstellen der Gruppe ${groupName}: $($_.Exception.Message)" -logLevel "ERROR"
+                    # Detaillierte Fehlerinformationen ausgeben
+                    if ($generalConfig.Debug -eq "1") {
+                        Write-DebugMessage "Exception-Details: $($_ | Format-List -Force | Out-String)"
+                    }
                 }
-                
-                Write-LogMessage "Gruppe $groupName erfolgreich erstellt" -logLevel "INFO"
             }
             catch {
                 Write-LogMessage "Fehler bei ${groupName}: $($_.Exception.Message)" -logLevel "ERROR"
             }
             
             $count++
-            # UI-Thread-sicheres Update der ProgressBar mit korrigierter Syntax
-            $progressForm.Invoke({
-                $progressBar.Value = [Math]::Min(($count / $total) * 100, 100)
-                $progressForm.Text = "Fortschritt: $($count)/$($total)"
-            })
+            # UI-Thread-sichere Aktualisierung der ProgressBar
+            $progressBar.Value = [Math]::Min([int](($count / $total) * 100), 100)
+            $progressForm.Text = "Fortschritt: $($count)/$($total)"
+            [System.Windows.Forms.Application]::DoEvents()
             
             Write-DebugMessage "Fortschritt: $count/$total Gruppen erstellt"
         }
