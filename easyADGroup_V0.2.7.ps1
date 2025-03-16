@@ -4,7 +4,7 @@
   # Author:         Andreas Hepp
   # Website:        https://phinit.de
   # GitHub:         https://github.com/PS-easyIT
-  # Version:        0.2.7 (Stand: 16.03.2023)
+  # Version:        0.2.7 (Stand: 16.03.2025)
   ####################################################################################################
   
   Dieses Skript stellt eine GUI-basierte Benutzeroberfläche für die Verwaltung von
