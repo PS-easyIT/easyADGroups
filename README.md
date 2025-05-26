@@ -2,7 +2,7 @@
 
 Ein modernes PowerShell-Tool mit Windows 11-inspirierter GUI für die einfache Verwaltung von Active Directory-Gruppen.
 
-![easyADgroup Screenshot](screenshot.png)
+![easyADgroup Screenshot](Screenshot_V0.3.1.jpg)
 
 ## 🚀 Neue Funktionen in v0.3.1
 
