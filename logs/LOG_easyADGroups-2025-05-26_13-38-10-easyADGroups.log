@@ -1,0 +1,9 @@
+﻿Log file initialized at 05/26/2025 13:38:10
+2025-05-26 13:38:10 [INFO] - Script gestartet - Version 0.3.1
+2025-05-26 13:38:10 [INFO] - AD-Daten werden abgerufen...
+2025-05-26 13:38:10 [INFO] - AD-Daten erfolgreich geladen
+2025-05-26 13:38:10 [INFO] - Anwendung gestartet und bereit
+2025-05-26 13:38:26 [WARNING] - Validierungsfehler bei Vorschau: No OU selected, Group name cannot be empty.
+2025-05-26 13:38:28 [INFO] - Erstellungs-Button geklickt
+2025-05-26 13:38:28 [WARNING] - Validierungsfehler bei Gruppenerstellung: No OU selected, Group name cannot be empty.
+2025-05-26 13:38:32 [INFO] - Anwendung wird beendet
