@@ -1,6 +1,6 @@
 # easyADgroup v0.3.1 - Modern AD Group Manager
 
-Ein modernes PowerShell-Tool mit Windows 11-inspirierter GUI für die einfache Verwaltung von Active Directory-Gruppen.
+Ein modernes PowerShell-Tool mit Windows 11-inspirierter GUI für die einfache Erstellung von Active Directory-Gruppen.
 
 ![easyADgroup Screenshot](Screenshot_V0.3.1.jpg)
 
